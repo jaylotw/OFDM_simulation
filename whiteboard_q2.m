@@ -2,7 +2,7 @@
 %% 
 % 
 
-CLEAN_RUN = true;
+CLEAN_RUN = false;
 
 if CLEAN_RUN
     clear; clc; clf; %#ok<UNRCH>
@@ -18,8 +18,8 @@ k = log2(M);            % Bits per symbol
 fft_size = 128;         % FFT size
 cp_length = 9;          % Cyclic prefix length
 
-mod_symbol_size = 128;   % Modulation symbol size
-used_subcarrier_idx = (1:128);
+mod_symbol_size = 48;   % Modulation symbol size
+used_subcarrier_idx = (41:88);
 
 N_block = 1e3;          % Number of blocks(OFDM symbols)
 N_trial = 1e3;          % Number of Monte Carlo trials
@@ -30,7 +30,8 @@ SNR = EbNo + 10*log10(k);   % Convert Eb/No to SNR(dB)
 % Block functions.
 
 % Precoder
-P = eye(mod_symbol_size);
+% P = eye(mod_symbol_size);   % OFDMA
+P = (1/sqrt(mod_symbol_size)) * dftmtx(mod_symbol_size);  % SC-FDMA
 
 % Add CP
 % Same as
@@ -52,33 +53,34 @@ rm_unused_sub_matrix = transpose(pad_unused_sub_matrix);
 % Channel.
 
 % Power delay profile
-c_dB = [0 -Inf -Inf -3 -Inf -Inf -Inf -Inf -Inf -5];
+h_dB = [0 -Inf -Inf -3 -Inf -Inf -Inf -Inf -Inf -5];
 
 % Channel impulse response
-c = db2mag(c_dB)';
+h = db2mag(h_dB)';
 
 % Channel frequency response
-C_k = fft(c, fft_size); % no normalization
+H_k = fft(h, fft_size); % no normalization
 
 % Circulant matrix
-C_circ = circulant_matrix(c, fft_size+cp_length);  % C_circ == T
+% H_circ = circulant_matrix(h, fft_size+cp_length);  % == T
 
-% conv(x,c) == C_low*x
-C_low = convmtx(c, fft_size);
-% L = remove_spread(C_low*x);
-L = [eye(fft_size) zeros(fft_size, cp_length)] * C_low;
+Gamma = diag(H_k);
 
 if DEBUG
     figure   %#ok<UNRCH>
-    stem(c)
+    stem(h)
     set(gca, 'yscale', 'log');
+    xlim([0, 11]); ylim([0.5, 1.1]);
 end
 %% 
 % Equalizers.
 
-% Zero-forcing
-Q_ZF_all_sub = diag(1./C_k);
+% Zero-forcing equalizer
+Q_ZF_all_sub = diag(1./H_k);
 Q_ZF = Q_ZF_all_sub(used_subcarrier_idx, used_subcarrier_idx);
+
+% least-squares equalizer
+% Q_ls = (H_low' * H_low)\H_low';
 %% 
 % Monte Carlo simulation.
 
@@ -87,14 +89,14 @@ ber_est = zeros(size(EbNo));
 
 tic
 
-for n = 1:length(EbNo)
+parfor n = 1:length(EbNo)
     % Reset the error bit counter
     numErrs = 0;
     
     % MMSE equalizer
-    % MMSE_snr = k * db2mag(SNR(n));
-    MMSE_snr = inf;
-    Q_MMSE = L* inv(L*L' + (1/MMSE_snr)*eye(fft_size));
+    MMSE_snr = k * db2mag(SNR(n));
+    Q_MMSE_all_sub = diag( (MMSE_snr*conj(H_k) ) ./ ( 1 + MMSE_snr*(abs(H_k).^2) ));
+    Q_MMSE = Q_MMSE_all_sub(used_subcarrier_idx, used_subcarrier_idx);
     
     for trial_idx = 1:N_trial
         % ---------- Tx ----------
@@ -107,7 +109,7 @@ for n = 1:length(EbNo)
         mod_symbol_data_block = reshape(mod_symbol_data_stream, mod_symbol_size, N_block);
         
         % Debug. Plot constellation:
-        if DEBUG && (n == 1) && (trial_idx == 1) && (block_idx == 1)
+        if DEBUG && (n == 5) && (trial_idx == 1)
             scatterplot(mod_symbol_data_stream), grid;
             title('Constellation');
         end
@@ -129,10 +131,10 @@ for n = 1:length(EbNo)
         txSig = reshape(cp_data, 1, []);
         
         % ------- Channel --------
-        channel_out = conv(txSig, c);
+        channel_out = conv(txSig, h);
         
         % Remove the part of the signal that was spread by the channel
-        channel_out_rm_spread = channel_out(1: end-length(c)+1);
+        channel_out_rm_spread = channel_out(1: end-length(h)+1);
         
         % AWGN noise
         rxSig = awgn(channel_out_rm_spread, SNR(n));
@@ -143,7 +145,7 @@ for n = 1:length(EbNo)
         
         % ---------- Rx ----------
         %Serial to parallel
-        rx_parallel = reshape(channel_out_rm_spread, fft_size+cp_length, N_block);
+        rx_parallel = reshape(rxSig, fft_size+cp_length, N_block);
         
         % Remove cyclic prefix
         rx_rm_cp = rm_CP_matrix * rx_parallel;
@@ -156,7 +158,14 @@ for n = 1:length(EbNo)
         rx_used_subcarrier = rm_unused_sub_matrix * rx_fft;
         
         % Equalizer
-        eq_out = Q_MMSE * rx_used_subcarrier;
+        eq_out = Q_ZF * rx_used_subcarrier;
+        
+        % Debug. Plot constellation:
+        if DEBUG && (n == 5) && (trial_idx == 1)
+            scatterplot(reshape(eq_out, [], 1)), grid;
+            xlim([-1, 1]); ylim([-1, 1]);
+            title('Constellation');
+        end
         
         % QAM demodulate
         rx_dec_data = qamdemod(eq_out, M, 'UnitAveragePower', true);
@@ -189,11 +198,16 @@ berTheory_awgn = berawgn(EbNo, 'qam', M);
 %% 
 % Plot estimated and theoretical BER.
 
-semilogy(EbNo, ber_est, '*');
+semilogy(EbNo, ber_OFDMA_ZF, 'Marker', 'o', 'Color', 'b', 'LineWidth', 2, 'MarkerSize', 8);
 hold on;
-semilogy(EbNo, berTheory_awgn);
+semilogy(EbNo, ber_OFDMA_MMSE, 'Marker', 'x', 'Color', 'c', 'LineWidth', 2, 'MarkerSize', 8);
+
+% semilogy(EbNo, ber_est, '*');
+% semilogy(EbNo, berTheory_awgn);
 grid;
-legend('Estimated BER','Theoretical BER');
+% legend('Estimated BER','Theoretical BER');
+
+legend('ZF', 'MMSE');
 ylabel('BER');
 xlim([0, 30]);
 xlabel('E_b/N_0 (dB)');
